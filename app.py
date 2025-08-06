@@ -2,100 +2,121 @@ import streamlit as st
 import requests
 from bs4 import BeautifulSoup
 import urllib.parse
-import re
-import random
+import json
 
-st.set_page_config(page_title="YouTube Viewer", page_icon="▶️")
-st.title("🎬 Resilient YouTube Viewer")
-
-# User-Agent rotation to mimic different browsers
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X)"
+# Configuration
+SEARCH_PROVIDERS = [
+    {
+        "name": "Invidious (Puffyan)",
+        "url": "https://vid.puffyan.us/search?q={query}",
+        "parser": "invidious"
+    },
+    {
+        "name": "YouTube Proxy",
+        "url": "https://ytproxy.vercel.app/search?q={query}",
+        "parser": "json"
+    }
 ]
 
-def extract_video_data(html):
-    """Extract video data from YouTube HTML"""
-    pattern = r'"videoRenderer":\{"videoId":"(.+?)".*?"title":\{"runs":\[\{"text":"(.+?)"\}'
-    matches = re.finditer(pattern, html)
-    videos = []
-    for match in matches:
-        video_id = match.group(1)
-        title = match.group(2)
-        videos.append({
-            "title": title,
-            "url": f"https://youtu.be/{video_id}",
-            "embed_url": f"https://www.youtube.com/embed/{video_id}"
-        })
-        if len(videos) >= 5:
+# Helper functions
+def search_invidious(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    results = []
+    for item in soup.select(".pure-g .pure-u-1"):
+        title = item.select_one("h2")
+        link = item.select_one("a[href^='/watch']")
+        if title and link:
+            results.append({
+                "title": title.text.strip(),
+                "url": f"https://vid.puffyan.us{link['href']}",
+                "embed_url": f"https://vid.puffyan.us/embed{link['href'].split('?')[0]}"
+            })
+        if len(results) >= 5:
             break
-    return videos
+    return results
 
-def search_youtube_direct(query):
-    """Search YouTube directly with multiple attempts"""
-    for attempt in range(3):
-        try:
-            headers = {
-                "User-Agent": random.choice(USER_AGENTS),
-                "Accept-Language": "en-US,en;q=0.9"
-            }
-            url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            
-            # Check if we got a CAPTCHA page
-            if "www.youtube.com/sorry" in response.url:
-                st.warning("YouTube is asking for CAPTCHA verification")
-                return []
-                
-            return extract_video_data(response.text)
-        except Exception as e:
-            if attempt == 2:
-                st.error(f"Final attempt failed: {str(e)}")
-            continue
-    return []
+def search_json(response):
+    data = response.json()
+    return [{
+        "title": item['title'],
+        "url": item['url'],
+        "embed_url": item['embed_url']
+    } for item in data[:5]]
 
-# Main App
-search_query = st.text_input("Search YouTube videos", placeholder="Try 'popular music' or 'news'")
+# Main app
+st.title("🎬 Organization-Friendly YouTube Viewer")
+
+# Search section
+search_query = st.text_input("Search videos")
 
 if search_query:
-    with st.spinner("Connecting to YouTube..."):
-        videos = search_youtube_direct(search_query)
+    results = None
+    for provider in SEARCH_PROVIDERS:
+        try:
+            st.info(f"Trying {provider['name']}...")
+            url = provider["url"].format(query=urllib.parse.quote(search_query))
+            response = requests.get(url, timeout=10)
+            
+            if provider["parser"] == "invidious":
+                results = search_invidious(response.text)
+            elif provider["parser"] == "json":
+                results = search_json(response)
+                
+            if results:
+                break
+                
+        except Exception as e:
+            st.warning(f"Failed with {provider['name']}: {str(e)}")
+            continue
     
-    if videos:
-        st.success(f"Found {len(videos)} videos")
-        for video in videos:
+    if results:
+        st.success("Found results!")
+        for video in results:
             with st.expander(video["title"]):
                 try:
                     st.video(video["embed_url"])
                 except:
-                    st.markdown(f"[Watch on YouTube]({video['url']})")
-                st.write("---")
+                    st.markdown(f"[Watch on {provider['name']}]({video['url']})")
     else:
         st.error("""
-        Couldn't fetch results. Possible solutions:
-        1. Try simpler/more common search terms
-        2. Check your internet connection
-        3. Wait a few minutes and try again
-        4. Use a VPN if YouTube is blocked
+        Couldn't fetch results. This might be because:
+        1. All alternative providers are blocked
+        2. Your organization has strict network filters
+        3. The search terms are too specific
+        
+        Try using the direct URL option below with a VPN.
         """)
-        st.markdown("As a last resort, you can use the direct URL option below.")
 
-# Direct URL fallback
+# Direct URL section
 st.write("---")
-st.subheader("Alternative: Enter Direct YouTube URL")
-video_url = st.text_input("Paste YouTube URL here", key="direct_url")
+st.subheader("Alternative: Use Direct URL")
+video_url = st.text_input("Paste any YouTube URL")
 
 if video_url:
     if any(x in video_url for x in ["youtube.com", "youtu.be"]):
         try:
+            # Extract video ID
             if "youtu.be" in video_url:
                 video_id = video_url.split("/")[-1].split("?")[0]
             else:
                 video_id = video_url.split("v=")[1].split("&")[0]
-            st.video(f"https://www.youtube.com/embed/{video_id}")
+            
+            # Try multiple embed methods
+            embed_urls = [
+                f"https://vid.puffyan.us/embed/{video_id}",
+                f"https://ytproxy.vercel.app/embed/{video_id}",
+                f"https://www.youtube.com/embed/{video_id}"
+            ]
+            
+            for url in embed_urls:
+                try:
+                    st.video(url)
+                    break
+                except:
+                    continue
+            else:
+                st.markdown(f"[Watch on YouTube]({video_url})")
         except:
-            st.video(video_url)  # Fallback
+            st.error("Couldn't process this URL")
     else:
         st.error("Please enter a valid YouTube URL")
